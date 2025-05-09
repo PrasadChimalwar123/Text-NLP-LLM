@@ -1,0 +1,302 @@
+# main_rag_script.py
+import os
+import fitz # PyMuPDF
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+from transformers import pipeline, AutoTokenizer, AutoModelForQuestionAnswering
+import torch
+
+# --- Configuration ---
+PDF_PATH = "example.pdf"  # Replace with your PDF file path
+CHUNK_SIZE = 500  # Number of characters per chunk
+CHUNK_OVERLAP = 50 # Number of characters to overlap between chunks
+TOP_K_RESULTS = 3 # Number of relevant chunks to retrieve
+EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
+QA_MODEL_NAME = 'distilbert-base-cased-distilled-squad' # A good starting QA model
+
+# --- Helper Functions ---
+
+def extract_text_from_pdf(pdf_path):
+    """
+    Extracts text from a PDF file.
+    Args:
+        pdf_path (str): The path to the PDF file.
+    Returns:
+        str: The extracted text content from the PDF.
+              Returns None if the PDF cannot be opened or read.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            text += page.get_text()
+        doc.close()
+        print(f"Successfully extracted text from '{pdf_path}'. Total characters: {len(text)}")
+        return text
+    except Exception as e:
+        print(f"Error opening or reading PDF '{pdf_path}': {e}")
+        return None
+
+def chunk_text(text, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP):
+    """
+    Splits text into overlapping chunks.
+    Args:
+        text (str): The input text to be chunked.
+        chunk_size (int): The desired size of each chunk (in characters).
+        chunk_overlap (int): The number of characters to overlap between consecutive chunks.
+    Returns:
+        list: A list of text chunks.
+    """
+    if not text:
+        return []
+    
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
+        if start >= len(text) and len(text) > (chunk_size - chunk_overlap) : # ensure last part is captured if small
+             if len(text) - (start - (chunk_size - chunk_overlap)) > chunk_overlap : # avoid re-adding same small chunk
+                last_chunk_start = start - (chunk_size - chunk_overlap)
+                if text[last_chunk_start:] not in chunks: # Check if the last piece is already added
+                    final_chunk = text[last_chunk_start:]
+                    if final_chunk.strip(): # Add only if it's not just whitespace
+                        chunks.append(final_chunk)
+    
+    # Remove duplicates that might arise from the logic, especially for the last chunk
+    unique_chunks = []
+    for chunk in chunks:
+        if chunk not in unique_chunks:
+            unique_chunks.append(chunk)
+
+    print(f"Chunked text into {len(unique_chunks)} chunks.")
+    return unique_chunks
+
+
+class RAGSystem:
+    def __init__(self, embedding_model_name=EMBEDDING_MODEL_NAME, qa_model_name=QA_MODEL_NAME):
+        """
+        Initializes the RAG system by loading the embedding and QA models.
+        Args:
+            embedding_model_name (str): Name of the sentence-transformer model for embeddings.
+            qa_model_name (str): Name of the Hugging Face model for question answering.
+        """
+        print("Initializing RAG system...")
+        # Load Sentence Transformer model for embeddings
+        try:
+            self.embedding_model = SentenceTransformer(embedding_model_name)
+            print(f"Embedding model '{embedding_model_name}' loaded successfully.")
+        except Exception as e:
+            print(f"Error loading embedding model '{embedding_model_name}': {e}")
+            raise
+
+        # Load Question Answering model and tokenizer
+        try:
+            self.qa_tokenizer = AutoTokenizer.from_pretrained(qa_model_name)
+            self.qa_model = AutoModelForQuestionAnswering.from_pretrained(qa_model_name)
+            # Use CUDA if available
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.qa_model.to(self.device)
+            self.qa_pipeline = pipeline('question-answering', model=self.qa_model, tokenizer=self.qa_tokenizer, device=0 if self.device.type == 'cuda' else -1)
+            print(f"QA model '{qa_model_name}' loaded successfully on {self.device}.")
+        except Exception as e:
+            print(f"Error loading QA model '{qa_model_name}': {e}")
+            raise
+            
+        self.text_chunks = []
+        self.faiss_index = None
+        self.is_prepared = False
+
+    def prepare_document(self, pdf_path, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP):
+        """
+        Processes a PDF: extracts text, chunks it, generates embeddings, and builds a FAISS index.
+        Args:
+            pdf_path (str): Path to the PDF document.
+            chunk_size (int): Size of text chunks.
+            chunk_overlap (int): Overlap between text chunks.
+        """
+        print(f"\nPreparing document: '{pdf_path}'")
+        if not os.path.exists(pdf_path):
+            print(f"Error: PDF file not found at '{pdf_path}'")
+            self.is_prepared = False
+            return
+
+        # 1. Extract text
+        raw_text = extract_text_from_pdf(pdf_path)
+        if not raw_text:
+            self.is_prepared = False
+            return
+
+        # 2. Chunk text
+        self.text_chunks = chunk_text(raw_text, chunk_size, chunk_overlap)
+        if not self.text_chunks:
+            print("No text chunks were generated. Cannot proceed.")
+            self.is_prepared = False
+            return
+
+        # 3. Generate embeddings for chunks
+        print("Generating embeddings for text chunks...")
+        try:
+            chunk_embeddings = self.embedding_model.encode(self.text_chunks, convert_to_tensor=False, show_progress_bar=True)
+            # Ensure embeddings are float32 for FAISS
+            chunk_embeddings = np.array(chunk_embeddings).astype('float32')
+        except Exception as e:
+            print(f"Error generating embeddings: {e}")
+            self.is_prepared = False
+            return
+
+        # 4. Build FAISS index
+        if chunk_embeddings.shape[0] > 0:
+            dimension = chunk_embeddings.shape[1]
+            self.faiss_index = faiss.IndexFlatL2(dimension) # Using L2 distance
+            self.faiss_index.add(chunk_embeddings)
+            print(f"FAISS index built successfully with {self.faiss_index.ntotal} vectors.")
+            self.is_prepared = True
+        else:
+            print("No embeddings generated, FAISS index not built.")
+            self.is_prepared = False
+
+
+    def answer_question(self, question, top_k=TOP_K_RESULTS):
+        """
+        Answers a question based on the prepared document.
+        Args:
+            question (str): The user's question.
+            top_k (int): The number of most relevant chunks to retrieve for context.
+        Returns:
+            str: The answer generated by the QA model, or an error message.
+        """
+        if not self.is_prepared:
+            return "The document has not been prepared yet. Please call 'prepare_document()' first."
+        if not self.faiss_index or self.faiss_index.ntotal == 0:
+            return "FAISS index is not available or empty. Cannot retrieve context."
+
+        print(f"\nAnswering question: '{question}'")
+
+        # 1. Embed the question
+        try:
+            question_embedding = self.embedding_model.encode([question], convert_to_tensor=False)
+            question_embedding = np.array(question_embedding).astype('float32')
+        except Exception as e:
+            return f"Error embedding question: {e}"
+
+        # 2. Retrieve relevant chunks from FAISS
+        try:
+            # D: distances, I: indices
+            distances, indices = self.faiss_index.search(question_embedding, k=min(top_k, self.faiss_index.ntotal)) 
+        except Exception as e:
+            return f"Error searching FAISS index: {e}"
+
+        if indices.size == 0 or indices[0][0] == -1 : # Check if any valid indices were returned
+            return "Could not find any relevant context for your question in the document."
+
+        retrieved_chunks = [self.text_chunks[i] for i in indices[0] if i != -1 and i < len(self.text_chunks)]
+        
+        if not retrieved_chunks:
+            return "No relevant chunks found after filtering. Try a different question or check document content."
+
+        # Concatenate retrieved chunks to form the context
+        context = " ".join(retrieved_chunks)
+        print(f"\n--- Retrieved Context (Top {len(retrieved_chunks)} chunks) ---")
+        for i, chunk_idx in enumerate(indices[0]):
+             if chunk_idx != -1 and chunk_idx < len(self.text_chunks):
+                print(f"Chunk {i+1} (Original Index: {chunk_idx}):\n{self.text_chunks[chunk_idx][:200]}...\n") # Print snippet
+        print("--- End of Retrieved Context ---")
+
+
+        # 3. Use QA model to find the answer within the context
+        try:
+            print("\nFeeding context to QA model...")
+            # The QA pipeline expects a dictionary with 'question' and 'context'
+            result = self.qa_pipeline(question=question, context=context)
+            answer = result['answer']
+            score = result['score']
+            print(f"QA Model Score: {score:.4f}")
+            if score < 0.1: # Threshold for confidence, can be adjusted
+                return f"The model found a potential answer, but with low confidence: '{answer}'. The information might not be explicitly in the retrieved context."
+            return answer
+        except Exception as e:
+            # This can happen if the context is too long for the QA model's max sequence length.
+            # A more robust solution would involve splitting the context or using a model with a larger window.
+            print(f"Error during question answering: {e}")
+            # Try with a truncated context as a fallback
+            max_len_qa = self.qa_tokenizer.model_max_length - len(self.qa_tokenizer.encode(question, truncation=False)) - 3 # Account for special tokens
+            if max_len_qa < 50: # If not enough space for context
+                 return "Error during question answering: Context too long and could not be effectively truncated."
+
+            truncated_context = self.qa_tokenizer.decode(self.qa_tokenizer.encode(context, truncation=True, max_length=max_len_qa))
+            print(f"Trying QA with truncated context (length: {len(truncated_context)} chars)...")
+            try:
+                result = self.qa_pipeline(question=question, context=truncated_context)
+                answer = result['answer']
+                score = result['score']
+                print(f"QA Model Score (truncated context): {score:.4f}")
+                return answer + " (Note: Answer derived from truncated context due to length limitations)"
+            except Exception as e_inner:
+                 return f"Error during question answering even with truncated context: {e_inner}"
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # Create a dummy PDF for testing if PDF_PATH doesn't exist
+    if not os.path.exists(PDF_PATH):
+        try:
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import letter
+            from reportlab.lib.units import inch
+
+            print(f"PDF file '{PDF_PATH}' not found. Creating a dummy PDF for demonstration.")
+            c = canvas.Canvas(PDF_PATH, pagesize=letter)
+            textobject = c.beginText(1 * inch, 10 * inch) # x, y from bottom left
+            textobject.setFont("Helvetica", 12)
+            
+            lines = [
+                "This is a sample PDF document created for testing the RAG system.",
+                "The RAG system, which stands for Retrieval Augmented Generation, is designed to answer questions.",
+                "It first retrieves relevant text passages from a document and then uses a generative model ",
+                "or a question-answering model to formulate an answer based on these passages.",
+                "The capital of France is Paris. Paris is known for the Eiffel Tower.",
+                "The primary colors are red, yellow, and blue. Mixing them creates secondary colors.",
+                "Python is a versatile programming language used in web development, data science, and AI.",
+                "Hugging Face provides many pre-trained models for natural language processing tasks.",
+                "FAISS is a library for efficient similarity search and clustering of dense vectors.",
+                "SentenceTransformers is a Python framework for state-of-the-art sentence, text and image embeddings."
+            ]
+            for line in lines:
+                textobject.textLine(line)
+            
+            c.drawText(textobject)
+            c.save()
+            print(f"Dummy PDF '{PDF_PATH}' created successfully.")
+        except ImportError:
+            print("ReportLab is not installed. Cannot create a dummy PDF.")
+            print(f"Please create a PDF file named '{PDF_PATH}' or install ReportLab ('pip install reportlab') to run the dummy PDF creation.")
+            exit()
+        except Exception as e:
+            print(f"Could not create dummy PDF: {e}")
+            exit()
+
+    # Initialize the RAG system
+    rag_sys = RAGSystem()
+
+    # Prepare the document (load, chunk, embed, index)
+    rag_sys.prepare_document(PDF_PATH)
+
+    if rag_sys.is_prepared:
+        # Ask questions
+        while True:
+            user_question = input("\nAsk a question about the PDF (or type 'quit' to exit): ")
+            if user_question.lower() == 'quit':
+                break
+            if not user_question.strip():
+                print("Please enter a question.")
+                continue
+            
+            answer = rag_sys.answer_question(user_question)
+            print(f"\nAnswer: {answer}")
+    else:
+        print("Could not prepare the document. Exiting.")
+
